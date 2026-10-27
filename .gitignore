@@ -30,3 +30,6 @@ cfiler_native/.vs/
 /dict/migemo-dict
 /dict/roma2hira.dat
 /dict/zen2han.dat
+
+# local session handover (may contain machine-specific info)
+/.claude/handover/
