@@ -6,6 +6,7 @@
 - 構成: §1〜8 は土台（ビルドと Python のモダン化）。§9 以降は機能追加の調査（1 件ずつ追記していく）
   - §9 機能 1: VS Code の Terminal を下ペインに移植する（チャットでの議論を反映済み）
   - §10 ネイティブ（Rust）化による高速化の候補（候補を挙げただけ。優先順位は未定）
+  - §11 機能 2: ファイルを VS Code のように色分けし、編集でき、Markdown のプレビューと PDF・Office の表示もできるようにする（チャットでの議論を反映済み）
 
 ## 1. 結論（要約）
 
@@ -17,6 +18,8 @@
 | 機能追加 | ○ | アプリの本体は Python（約 13,200 行）。C++ は約 1,800 行で、ほぼ起動処理とネイティブ補助だけ |
 | 機能 1: VS Code の Terminal を下ペインに移植 | ○ 機能としては実現できる。コードをそのまま移植するのは不可 | ConPTY + Python 製の VT エミュレーター + ckit の描画で、ポータブルなまま実現できる。VS Code からはシェル統合スクリプトとロジックを流用する（§9） |
 | Rust による高速化 | ○ 部分的に置き換えるなら有効 | ckit を全部書き換えても速くならない。端末の解析、Grep、差分、文字コード判定に絞ると効果が大きい（§10） |
+| 機能 2: VS Code のような表示と編集（ソースコード、Markdown、PDF、Office） | ○ 形式ごとに方式を分ければ実現できる | ソースコードは ckit の TextWidget と VS Code の TextMate 文法で色分けする。Markdown のプレビューは WebView2 と markdown-it 一式。PDF と Office は Windows のプレビューハンドラ（§11） |
+| 機能 2: VS Code のような表示と編集（ソースコード、Markdown、PDF、Office） | ○ 形式ごとに方式を分ければ実現できる | ソースコードは ckit の TextWidget と VS Code の TextMate 文法で色分けする。Markdown のプレビューは WebView2 と markdown-it 一式。PDF と Office は Windows のプレビューハンドラ（§11） |
 
 **推奨**: 目標の Python は **3.13** にする（ckit / pyauto の本家と揃うため）。3.8 での基準ビルドは行わず、cfiler 本体を 3.13 に移植してから機能追加に入る。
 
@@ -270,3 +273,169 @@ ConPTY の出力(バイト列)
 - **Rust 側で GIL を手放して処理する** → 速くなるだけでなく、Grep などのバックグラウンド処理中も画面の操作がなめらかになる（今は Python のスレッドが GIL を握るため、処理中は画面が重くなる）
 - 順番の候補: 端末 → Grep と文字コード判定 → 差分。ただし**計測してから着手する**
 - 開発環境には Rust のツールチェーンと maturin が増える（新しい PC で uv と一緒に用意する）
+
+---
+
+## 11. 機能 2: ファイルを VS Code のように表示・編集する
+
+### 11.1 要件
+- 今は Return でファイルを開くと**読み取り専用**で表示される（`cfiler_textviewer.py` の `TextViewer`）。テキストは 1 色で表示し、バイナリは 16 進ダンプにする。編集は外部エディタに任せる（`window.editor`。既定は `notepad.exe`、`cfiler_mainwindow.py:338`）
+- これを広げて、**VS Code で開いたときのように色分けし、編集もできる**ようにしたい
+- 対象の形式
+  - ソースコード: py、json、yaml、javascript、typescript、go など
+  - Markdown: プレビューも含める
+  - Office（Excel、Word、PowerPoint）: 読み取り専用でよい
+  - PDF: 読み取り専用でよい
+- VS Code から移植するコードや部品も cfiler の中に同梱し、インストール不要という特長を保つ
+- 画面遷移（Return で直接編集にするか、ビューアから編集に切り替えるか、など）はこの調査の対象外とし、後で決める
+
+### 11.2 結論と、議論で決めた方針
+| 形式 | 方式 | 判定 |
+|---|---|---|
+| ソースコード（テキストのファイル全般） | **A. ckit だけで作る**: ckit の `TextWidget` を使い、**VS Code の TextMate 文法とテーマ**で色分けする | ◎ |
+| Markdown | 原文は A で編集する。**プレビューは WebView2 + markdown-it 一式**で、Markdown Preview Enhanced（MPE）と同じ仕組みにする | ◎（WebView2 の組み込みが前提） |
+| PDF、Office | **C. Windows のプレビューハンドラ**（エクスプローラーのプレビューウィンドウと同じ仕組み）を子ウィンドウに表示する | ○（Office はその PC に Office が入っていることが前提） |
+| バイナリ | 今の 16 進ダンプのまま | ― |
+
+検討して採らなかった案
+- **すべてを WebView2 + Monaco（VS Code のエディタ部品）にする**: VS Code との一致では最も良いが、重い（メモリが 100 MB 程度増える）うえ、キーとフォーカスの統合が難しい。ckit に既にエディタ部品があるので、ソースコードには使わない
+- **VectorCraft**（storytold/vectorcraft）: Rust 製のベクター描画ソフト（Illustrator 系、アルファ版）。PDF はベクター図形として取り込むためのもので、文書のビューアではない。Office には対応していない。ライブラリとして組み込む方法も公開されていない → 不採用
+- **Pygments**: 手軽だが、規則が VS Code とは別物（独自の lexer）。「VS Code 準拠」にならない
+- **Tree-sitter**: 構文解析なので正確だが、言語ごとに DLL が要る。ckit の、行ごとに状態を引き継ぐ色分けの入口にも合わせにくい
+
+### 11.3 ソースコード: ckit の TextWidget と TextMate 文法
+**使える部品（ckit に既にある）**
+- `ckit_textwidget.py`（約 3,560 行）は複数行のエディタ部品で、crftwr 氏のエディタ LREdit の中核部分。cfiler では今は使っていない
+  - `Document`、`TextWidget`、Undo（`UndoInfo`）、選択（`Selection`）、検索（`Search`）、補完（`WordCompletion`）、編集モード（`Mode`）を持つ
+  - 色分けの入口は `Lexer.lex(ctx, line, detail)`（:72）。前の行の状態（ctx）を受け取って 1 行ずつ処理する。正規表現を表にした `RegexLexer` もある
+  - トークンの種類は 8 種類の固定値（`Token_Keyword` / `Name` / `Number` / `String` / `Preproc` / `Comment` / `Space` / `Text`）
+
+**VS Code の色分けの仕組み（microsoft/vscode、MIT）**
+| 層 | VS Code の実装 | 場所 |
+|---|---|---|
+| 言語の定義（予約語、文法、入れ子） | TextMate 文法（`.tmLanguage.json`）。トークンに `keyword.control.python` のような種別名（scope）を付ける | `extensions/<言語>/syntaxes/`（約 50 言語） |
+| 拡張子と言語の対応 | 各拡張の `package.json` の `contributes.languages` | `extensions/<言語>/package.json` |
+| 文法を解析するエンジン | `vscode-textmate`（JavaScript）と Oniguruma（正規表現エンジン） | 別リポジトリ microsoft/vscode-textmate |
+| 配色 | テーマファイルが種別名を色に対応させる（例: Dark+） | `extensions/theme-defaults/themes/dark_plus.json` など |
+| 意味に基づく色付け | 言語サーバー（LSP）が後から上乗せする | **対象外** |
+
+→ **VS Code の文法ファイルとテーマファイルを cfiler にそのまま同梱し、それを解析するエンジンを Python で用意すれば、言語ごとの規則を自前で書かずに VS Code と同じ精度で色分けできる**
+
+**ckit との相性**
+- TextMate 文法は 1 行ずつ処理し、前の行の状態（規則のスタック）を次の行に引き継ぐ。ckit の `Lexer.lex(ctx, line)` と仕組みがほぼ同じなので、TextMate のエンジンを `Lexer` の派生クラスとして実装できる
+
+**手本になる実例**
+- **babi**（asottile/babi、Python 製のターミナル向けエディタ、MIT）は、VS Code の TextMate 文法を純粋な Python で解釈している
+  - 正規表現には `onigurumacffi`（Oniguruma を Python から使う部品。Windows 用の配布パッケージがある）を使う
+  - 文法ファイルは `babi-grammars` パッケージにまとめてある
+  - この解析部分を手本にするか移植するのが最短
+
+**作業**
+1. TextMate の解析エンジン（babi を参考にする）と、拡張子から言語を選ぶ表を作る
+2. テーマ JSON の種別名を ckit の色（`Attribute` は RGB の文字色を扱える）に変換する。**今のトークンは 8 種類の固定値なので、テーマの色を通すには ckit 側の修正が要る**（ckit は Fork する予定なので対応できる。例: トークンの種類の代わりに色の番号を入れる）
+3. 遅ければ、解析部分だけを Rust の `cfiler_rs` に置き換える（§10.4 の方針どおり。Rust の syntect も TextMate 系の文法を読める）
+
+**注意点**
+- 一部の文法は他の言語の文法を取り込む（例: Markdown のコードブロックの中で Python を色分けする）。取り込み先の解決まで実装する必要がある（babi は対応済み）
+- 文法ファイルごとに元のライセンスがある（`cgmanifest.json` に記載）。同梱するときは一覧を `license/` に入れる
+- Python では処理が遅めなので、表示する行だけを解析し、行の状態をキャッシュする
+- 文字コード（SJIS など）は今のビューアの判定処理を使う。保存するときは元の文字コードに戻す
+
+### 11.4 Markdown: MPE と同じ機能を作る
+VS Code の拡張は Extension Host（拡張用の API）の上で動くので、cfiler では動かない。ただし MPE（shd101wyy/vscode-markdown-preview-enhanced）の中核は **crossnote** という別のライブラリになっていて、主な部品は一般的な JavaScript のライブラリである。**これらを WebView2 の中で組み合わせれば、ほぼ同じ機能になる**。Node.js は不要で、すべて cfiler のフォルダに同梱できる。
+
+| 部品 | 役割 |
+|---|---|
+| markdown-it と各種プラグイン | 描画（VS Code 標準のプレビューと同じ）。目次、脚注、チェックボックス、絵文字 |
+| Prism または highlight.js | コードブロックの色分け |
+| Mermaid | 図（約 3 MB） |
+| KaTeX | 数式（フォント込みで約 1 MB） |
+| less.js | style.less を CSS に変換する（ブラウザの中で動く） |
+
+同梱物は合計で 5〜8 MB 程度。MPE / crossnote 本体のライセンスは同梱前に確認する（テーマの CSS などを流用する場合）。
+
+**全体の構成**
+```
+ckit の TextWidget（原文。TextMate の Markdown 文法で色分け）
+   │ スクロールやカーソル移動 → 画面の先頭行の番号
+   ▼ Python から PostWebMessage
+WebView2 の中の JavaScript（markdown-it で描画）
+   └ data-source-line から位置を按分 → scrollTo
+   ▲ プレビュー側のスクロール → WebMessageReceived
+Python → ckit の scroll_info を更新
+```
+
+**1. 原文とプレビューの表示位置の同期（MPE と同じ方式）: ◎**
+- markdown-it で HTML を作るとき、見出し・段落・コードブロックなどの各要素に、原文の何行目かを表す `data-source-line` を付ける
+- 原文側の画面の先頭行の前後にある 2 つの要素の位置から間を按分して、プレビューのスクロール位置を決める。逆方向（プレビュー → 原文）も同じ対応表で計算する
+- 編集した内容は、200〜300 ms 程度入力が止まってから全文を送って描画し直す（スクロール位置は保つ）
+- 「カーソルがある行をプレビュー側で強調する」機能も同じ対応表で作れる
+
+**2. style.less で見た目を変える: ◎**
+- ユーザーの `style.less` を less.js で CSS に変換し、最後に差し込む
+- MPE の style.less は `.markdown-preview.markdown-preview { … }` という書き方を前提にしている。プレビューの外枠に同じ class 名を付ければ、**今使っている style.less をほぼそのまま流用できる見込み**
+- ファイルは cfiler のフォルダ内に置く（例: `markdown/style.less`）。保存を検知して、すぐにプレビューに反映する
+- MPE の組み込みテーマ（github-light など）も CSS なので同梱できる
+
+**3. MPE のその他の機能**
+| 機能 | 実現性 | 補足 |
+|---|---|---|
+| コードブロックの色分け、Mermaid、KaTeX、目次、脚注、チェックボックス、絵文字 | ◎ | 同梱するライブラリでまかなえる |
+| 相対パスの画像 | ◎ | WebView2 の `SetVirtualHostNameToFolderMapping` で、文書のフォルダを仮想のホスト名に割り当てる |
+| PDF への書き出し | ○ | WebView2 の `PrintToPdf` |
+| HTML への書き出し | ○ | 描画した結果と CSS をまとめて保存する |
+| PlantUML | △ | Java か外部サーバーが必要。後回し |
+| Code Chunk（コードの実行） | △ | 外部プロセスの実行と安全性の設計が必要。後回し |
+| スライド表示（reveal.js） | △ | 同梱すればできるが、優先度は低い |
+
+**C++ なしで先に試す方法（PoC）**
+1. Python の簡易 HTTP サーバーで、プレビュー用の HTML（markdown-it、less.js、Mermaid）を配信する
+2. 普段使うブラウザで開き、cfiler 側とはサーバー経由（WebSocket や SSE）でスクロール位置を送り合う
+3. 同期の精度と、style.less をそのまま流用できるかを先に確かめてから、表示先を WebView2 に差し替える（HTML と JavaScript はそのまま使い回せる）
+
+### 11.5 PDF と Office: Windows のプレビューハンドラ（方式 C）
+- エクスプローラーのプレビューウィンドウと同じ COM の仕組み（`IPreviewHandler`）を使い、cfiler の子ウィンドウに表示する。COM の呼び出しには既に依存している comtypes を使うか、cfiler_native（C++）に実装する
+- 拡張子ごとに登録されているハンドラを使う。そのため、**Office が入っている PC では Excel・Word・PowerPoint を本物と同じ見た目で表示できる**（古い .doc / .xls も表示できる）。PDF も、Edge や Acrobat のハンドラが登録されていれば表示できる
+- 表示は読み取り専用。要件どおり
+- **Office が入っていない PC の代わりの方法**
+  | 形式 | 方法 | 品質 |
+  |---|---|---|
+  | PDF | **PDFium**（Chrome の PDF エンジン、BSD / Apache）。Python から使う pypdfium2 でページを画像にし、ckit の画像ビューアで見る | ○ 忠実 |
+  | Excel | **calamine**（Rust、MIT）で表として表示する。`cfiler_rs` に入れられる | △ 書式やグラフは出ない |
+  | Word / PowerPoint | python-docx / python-pptx などで文字を取り出す | △ 見た目は再現できない |
+- 補足
+  - 同梱できて Office の見た目まで忠実に描けるライブラリは、事実上ない。VS Code 自体も Office は開けない（ここは VS Code にない機能）
+  - MuPDF は AGPL なので、同梱すると cfiler 側の配布条件にも影響する。避ける
+
+### 11.6 共通の前提: WebView2 の組み込み（Markdown のプレビューで必要）
+- ckit は等幅の文字と画像しか描けないので、HTML を描くには WebView2 が必須
+- WebView2 のランタイムは Windows 11 に標準で入っている（Evergreen 版）。cfiler には SDK の WebView2Loader を静的リンクし、`cfiler_native`（C++）に組み込む → Python 3.13 への移植（§4）が前提
+- Python とのやりとりは `PostWebMessageAsJson` / `ExecuteScript` と `WebMessageReceived` で行う
+- WebView2 のデータフォルダは cfiler のフォルダの中に置き、ポータブル性を保つ
+
+### 11.7 未決定の事項（仕様を決める段階で検討する）
+1. Return の動作（直接編集にするか、色付きのビューア → キーで編集の 2 段にするか）と、開き方（全画面の別ウィンドウか、ペインの中か）
+2. 新しい PC に Office（デスクトップ版）が入るか（方式 C を使えるかに関わる）
+3. 配色テーマ（Dark+ をそのまま使うか、cfiler のテーマと合わせるか）
+4. Markdown を開いたときの初期の表示（原文とプレビューの左右分割か、プレビューだけか）
+5. 大きなファイルの上限（何 MB から今の軽いビューアに任せるか）
+
+### 11.8 リスク
+| リスク | 影響 | 対策 |
+|---|---|---|
+| Python の TextMate エンジンが遅い | 大きなファイルで表示がもたつく | 表示する行だけを解析し、状態をキャッシュする。それでも足りなければ Rust（syntect など）に置き換える |
+| ckit のトークンの仕組みの変更 | ckit の Fork を本家から少し離すことになる | 変更を `Token` と描画処理の範囲にとどめる |
+| WebView2 がキーを受け取ってしまう | Esc や切り替えキーが効かない | `AcceleratorKeyPressed` で cfiler の keymap にあるキーだけを横取りする |
+| Markdown に書かれた HTML やスクリプト | 他人の .md を開いたときに任意のスクリプトが動く | 既定では無害化し、Mermaid など同梱したスクリプトだけを許可する。CSP で制限する |
+| プレビューハンドラの不安定さ | ハンドラによっては cfiler ごと固まったり落ちたりする | 別プロセスで表示する（`prevhost.exe` 方式）か、タイムアウトを設ける |
+| 長い Markdown 文書 | 全文を描き直すと遅い | 変更されたブロックだけを差し替える最適化を後で入れる |
+
+### 11.9 進め方（案）
+| 段階 | 内容 | 目安 |
+|---|---|---|
+| PoC-1 | TextMate エンジンを ckit の `Lexer` に組み込み、今のビューアで色付き表示する（py / json / yaml / js / ts / go） | 1〜2 週 |
+| PoC-2 | ブラウザ版の Markdown プレビュー（HTTP サーバー + markdown-it + less.js）で、同期と style.less の流用を確かめる | 1 週 |
+| MVP-1 | TextWidget で編集と保存（文字コードを保つ）、テーマの反映 | 2〜3 週 |
+| MVP-2 | WebView2 を cfiler_native に組み込み、Markdown の左右分割プレビュー | 2〜3 週 |
+| MVP-3 | プレビューハンドラで PDF と Office を表示する。Office が無い環境では PDFium / calamine で代わりに表示する | 1〜2 週 |
+| 拡張 | PDF / HTML への書き出し、PlantUML、Code Chunk、Rust 化 | ― |
